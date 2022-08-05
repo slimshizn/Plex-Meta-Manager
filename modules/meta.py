@@ -1,7 +1,7 @@
 import math, operator, os, re, requests
 from datetime import datetime
 from modules import plex, ergast, util
-from modules.util import Failed, YAML
+from modules.util import Failed, NotScheduled, YAML
 from plexapi.exceptions import NotFound, BadRequest
 
 logger = util.logger
@@ -21,7 +21,10 @@ dynamic_attributes = [
     "type", "data", "exclude", "addons", "template", "template_variables", "other_template", "remove_suffix",
     "remove_prefix", "title_format", "key_name_override", "title_override", "test", "sync", "include", "other_name"
 ]
-auto_type_translation = {"content_rating": "contentRating", "subtitle_language": "subtitleLanguage", "audio_language": "audioLanguage"}
+auto_type_translation = {
+    "content_rating": "contentRating", "subtitle_language": "subtitleLanguage", "audio_language": "audioLanguage",
+    "album_style": "album.style"
+}
 default_templates = {
     "original_language": {"plex_all": True, "filters": {"original_language": "<<value>>"}},
     "origin_country": {"plex_all": True, "filters": {"origin_country": "<<value>>"}},
@@ -71,7 +74,7 @@ class DataFile:
         self.templates = {}
 
     def get_file_name(self):
-        data = f"{util.github_base}{self.path}.yml" if self.type == "GIT" else self.path
+        data = f"{self.config.GitHub.configs_url}{self.path}.yml" if self.type == "GIT" else self.path
         if "/" in data:
             if data.endswith(".yml"):
                 return data[data.rfind("/") + 1:-4]
@@ -89,7 +92,7 @@ class DataFile:
         if file_type in ["URL", "Git", "Repo"]:
             if file_type == "Repo" and not self.config.custom_repo:
                 raise Failed("Config Error: No custom_repo defined")
-            content_path = file_path if file_type == "URL" else f"{self.config.custom_repo if file_type == 'Repo' else util.github_base}{file_path}.yml"
+            content_path = file_path if file_type == "URL" else f"{self.config.custom_repo if file_type == 'Repo' else self.config.GitHub.configs_url}{file_path}.yml"
             response = self.config.get(content_path)
             if response.status_code >= 400:
                 raise Failed(f"URL Error: No file found at {content_path}")
@@ -103,13 +106,12 @@ class DataFile:
                 raise Failed(f"File Error: File does not exist {os.path.abspath(file_path)}")
         return yaml.data
 
-    def apply_template(self, name, data, template_call):
+    def apply_template(self, name, mapping_name, data, template_call):
         if not self.templates:
             raise Failed(f"{self.data_type} Error: No templates found")
         elif not template_call:
             raise Failed(f"{self.data_type} Error: template attribute is blank")
         else:
-            logger.debug(f"Value: {template_call}")
             new_attributes = {}
             for variables in util.get_list(template_call, split=False):
                 if not isinstance(variables, dict):
@@ -123,6 +125,9 @@ class DataFile:
                 elif not isinstance(self.templates[variables["name"]][0], dict):
                     raise Failed(f"{self.data_type} Error: template {variables['name']} is not a dictionary")
                 else:
+                    logger.debug(f"Template {variables['name']}")
+                    logger.debug(f"Call: {variables}")
+
                     remove_variables = []
                     for tm in variables:
                         if variables[tm] is None:
@@ -132,14 +137,18 @@ class DataFile:
                         variables.pop(remove_variable)
                         optional.append(str(remove_variable))
 
+                    template, temp_vars = self.templates[variables["name"]]
+
+                    if not name and "name" in template:
+                        name = template["name"]
+                    elif not name:
+                        name = mapping_name
+
                     name_var = f"{self.data_type.lower()}_name"
-                    if name_var not in variables:
-                        variables[name_var] = str(name)
-
+                    variables[name_var] = str(name)
+                    variables["mapping_name"] = mapping_name
                     variables["library_type"] = self.library.type.lower() if self.library else "items"
-
-                    template_name = variables["name"]
-                    template, temp_vars = self.templates[template_name]
+                    variables["library_name"] = self.library.name if self.library else "playlist"
 
                     for temp_key, temp_value in temp_vars.items():
                         if temp_value is None:
@@ -157,6 +166,22 @@ class DataFile:
                         variables[f"{key}_encoded"] = requests.utils.quote(str(value))
 
                     default = {}
+                    def add_default(d_key, d_value):
+                        for v_key, v_value in variables.items():
+                            if f"<<{v_key}>>" in str(d_value):
+                                d_value = str(d_value).replace(f"<<{v_key}>>", str(v_value))
+                        default[d_key] = d_value
+                        default[f"{d_key}_encoded"] = requests.utils.quote(str(d_value))
+
+                    def small_var_check(var_check):
+                        for var_k, var_v in variables.items():
+                            if f"<<{var_k}>>" in str(var_check):
+                                var_check = str(var_check).replace(f"<<{var_k}>>", str(var_v))
+                        for var_k, var_v in default.items():
+                            if f"<<{var_k}>>" in str(var_check):
+                                var_check = str(var_check).replace(f"<<{var_k}>>", str(var_v))
+                        return var_check
+
                     if "default" in template:
                         if not template["default"]:
                             raise Failed(f"{self.data_type} Error: template sub-attribute default is blank")
@@ -169,11 +194,7 @@ class DataFile:
                                     final_key = final_key.replace(f"<<{k}>>", str(v))
                             if final_key not in optional:
                                 final_value = template["default"][dv]
-                                for key, value in variables.items():
-                                    if f"<<{key}>>" in str(final_value):
-                                        final_value = str(final_value).replace(f"<<{key}>>", str(value))
-                                default[final_key] = final_value
-                                default[f"{final_key}_encoded"] = requests.utils.quote(str(final_value))
+                                add_default(final_key, final_value)
 
                     if "optional" in template:
                         if template["optional"]:
@@ -185,9 +206,82 @@ class DataFile:
                                     optional.append(str(op))
                                     optional.append(f"{op}_encoded")
                                 else:
-                                    logger.warning(f"Template Warning: variable {op} cannot be optional if it has a default")
+                                    logger.debug("")
+                                    logger.debug(f"Template Warning: variable {op} cannot be optional if it has a default")
                         else:
                             raise Failed(f"{self.data_type} Error: template sub-attribute optional is blank")
+
+                    if "conditionals" in template:
+                        if not template["conditionals"]:
+                            raise Failed(f"{self.data_type} Error: template sub-attribute conditionals is blank")
+                        if not isinstance(template["conditionals"], dict):
+                            raise Failed(f"{self.data_type} Error: template sub-attribute conditionals is not a dictionary")
+                        for con_key, con_value in template["conditionals"].items():
+                            logger.debug("")
+                            logger.debug(f"Conditional: {con_key}")
+                            if not isinstance(con_value, dict):
+                                raise Failed(f"{self.data_type} Error: template sub-attribute conditionals is not a dictionary")
+                            final_key = small_var_check(con_key)
+                            if final_key != con_key:
+                                logger.debug(f"Variable: {final_key}")
+                            if final_key in variables:
+                                continue
+                            if "conditions" not in con_value:
+                                raise Failed(f"{self.data_type} Error: conditions sub-attribute required for conditionals")
+                            conditions = con_value["conditions"]
+                            if isinstance(conditions, dict):
+                                conditions = [conditions]
+                            if not isinstance(conditions, list):
+                                raise Failed(f"{self.data_type} Error: conditions sub-attribute must be a list or dictionary")
+                            condition_found = False
+                            for i, condition in enumerate(conditions, 1):
+                                if not isinstance(condition, dict):
+                                    raise Failed(f"{self.data_type} Error: each condition must be a dictionary")
+                                if "value" not in condition:
+                                    raise Failed(f"{self.data_type} Error: each condition must have a result value")
+                                condition_passed = True
+                                for var_key, var_value in condition.items():
+                                    if var_key == "value":
+                                        continue
+                                    var_key = small_var_check(var_key)
+                                    var_value = small_var_check(var_value)
+                                    if var_key in variables:
+                                        if (isinstance(var_value, list) and variables[var_key] not in var_value) or \
+                                            (not isinstance(var_value, list) and variables[var_key] != var_value):
+                                            if isinstance(var_value, list):
+                                                logger.debug(f'Condition {i} Failed: {var_key} "{variables[var_key]}" not in {var_value}')
+                                            else:
+                                                logger.debug(f'Condition {i} Failed: {var_key} "{variables[var_key]}" is not "{var_value}"')
+                                            condition_passed = False
+                                            break
+                                    elif var_key in default:
+                                        if (isinstance(var_value, list) and default[var_key] not in var_value) or \
+                                            (not isinstance(var_value, list) and default[var_key] != var_value):
+                                            if isinstance(var_value, list):
+                                                logger.debug(f'Condition {i} Failed: {var_key} "{default[var_key]}" not in {var_value}')
+                                            else:
+                                                logger.debug(f'Condition {i} Failed: {var_key} "{default[var_key]}" is not "{var_value}"')
+                                            condition_passed = False
+                                            break
+                                    else:
+                                        logger.debug(f"Condition {i} Failed: {var_key} is not a variable provided or a default variable")
+                                        condition_passed = False
+                                        break
+                                if condition_passed:
+                                    logger.debug(f'Conditional Variable: {final_key} is "{condition["value"]}"')
+                                    condition_found = True
+                                    variables[final_key] = condition["value"]
+                                    variables[f"{final_key}_encoded"] = requests.utils.quote(str(condition["value"]))
+                                    break
+                            if not condition_found:
+                                if "default" in con_value:
+                                    logger.debug(f'Conditional Variable: {final_key} defaults to "{con_value["default"]}"')
+                                    variables[final_key] = con_value["default"]
+                                    variables[f"{final_key}_encoded"] = requests.utils.quote(str(con_value["default"]))
+                                else:
+                                    logger.debug(f"Conditional Variable: {final_key} added as optional variable")
+                                    optional.append(str(final_key))
+                                    optional.append(f"{final_key}_encoded")
 
                     sort_name = None
                     if "move_prefix" in template or "move_collection_prefix" in template:
@@ -195,7 +289,8 @@ class DataFile:
                         if "move_prefix" in template:
                             prefix = template["move_prefix"]
                         elif "move_collection_prefix" in template:
-                            logger.warning(f"{self.data_type} Error: template sub-attribute move_collection_prefix will run as move_prefix")
+                            logger.debuf("")
+                            logger.debug(f"{self.data_type} Warning: template sub-attribute move_collection_prefix will run as move_prefix")
                             prefix = template["move_collection_prefix"]
                         if prefix:
                             for op in util.get_list(prefix):
@@ -206,12 +301,44 @@ class DataFile:
                             raise Failed(f"{self.data_type} Error: template sub-attribute move_prefix is blank")
                     variables[f"{self.data_type.lower()}_sort"] = sort_name if sort_name else variables[name_var]
 
+                    logger.debug("")
+                    logger.debug(f"Variables: {variables}")
+                    logger.debug("")
+                    logger.debug(f"Defaults: {default}")
+                    logger.debug("")
+                    logger.debug(f"Optional: {optional}")
+
+                    def check_for_var(_method, _data):
+                        def scan_text(og_txt, var, actual_value):
+                            if og_txt is None:
+                                return og_txt
+                            elif str(og_txt) == f"<<{var}>>":
+                                return actual_value
+                            elif f"<<{var}>>" in str(og_txt):
+                                return str(og_txt).replace(f"<<{var}>>", str(actual_value))
+                            else:
+                                return og_txt
+                        for i in range(6):
+                            if i == 2 or i == 4:
+                                for dm, dd in default.items():
+                                    _data = scan_text(_data, dm, dd)
+                            else:
+                                for option in optional:
+                                    if option not in variables and f"<<{option}>>" in str(_data):
+                                        raise Failed
+                                for variable, variable_data in variables.items():
+                                    if (variable == "collection_name" or variable == "playlist_name") and _method in ["radarr_tag", "item_radarr_tag", "sonarr_tag", "item_sonarr_tag"]:
+                                        _data = scan_text(_data, variable, variable_data.replace(",", ""))
+                                    elif variable != "name":
+                                        _data = scan_text(_data, variable, variable_data)
+                        return _data
+
                     def check_data(_method, _data):
                         if isinstance(_data, dict):
                             final_data = {}
                             for sm, sd in _data.items():
                                 try:
-                                    final_data[sm] = check_data(_method, sd)
+                                    final_data[check_for_var(_method, sm)] = check_data(_method, sd)
                                 except Failed:
                                     continue
                             if not final_data:
@@ -226,39 +353,23 @@ class DataFile:
                             if not final_data:
                                 raise Failed
                         else:
-                            final_data = _data
-                            def scan_text(og_txt, var, var_value):
-                                if og_txt is None:
-                                    return og_txt
-                                elif str(og_txt) == f"<<{var}>>":
-                                    return var_value
-                                elif f"<<{var}>>" in str(og_txt):
-                                    return str(og_txt).replace(f"<<{var}>>", str(var_value))
-                                else:
-                                    return og_txt
-
-                            for i in range(2):
-                                for option in optional:
-                                    if option not in variables and f"<<{option}>>" in str(final_data):
-                                        raise Failed
-                                for variable, variable_data in variables.items():
-                                    if (variable == "collection_name" or variable == "playlist_name") and _method in ["radarr_tag", "item_radarr_tag", "sonarr_tag", "item_sonarr_tag"]:
-                                        final_data = scan_text(final_data, variable, variable_data.replace(",", ""))
-                                    elif variable != "name":
-                                        final_data = scan_text(final_data, variable, variable_data)
-                            for dm, dd in default.items():
-                                final_data = scan_text(final_data, dm, dd)
+                            final_data = check_for_var(_method, _data)
                         return final_data
 
                     for method_name, attr_data in template.items():
-                        if method_name not in data and method_name not in ["default", "optional", "move_collection_prefix", "move_prefix"]:
-                            if method_name in new_attributes:
-                                logger.warning(f"Template Warning: template attribute: {method_name} from {variables['name']} skipped")
-                            else:
-                                try:
-                                    new_attributes[method_name] = check_data(method_name, attr_data)
-                                except Failed:
-                                    continue
+                        if method_name not in data and method_name not in ["default", "optional", "conditionals", "move_collection_prefix", "move_prefix"]:
+                            try:
+                                new_name = check_for_var(method_name, method_name)
+                                if new_name in new_attributes:
+                                    logger.info("")
+                                    logger.warning(f"Template Warning: template attribute: {new_name} from {variables['name']} skipped")
+                                else:
+                                    new_attributes[new_name] = check_data(new_name, attr_data)
+                            except Failed:
+                                continue
+            logger.debug("")
+            logger.debug(f"Final Template Attributes: {new_attributes}")
+            logger.debug("")
             return new_attributes
 
     def external_templates(self, data):
@@ -276,6 +387,9 @@ class DataFile:
 class MetadataFile(DataFile):
     def __init__(self, config, library, file_type, path, temp_vars, asset_directory):
         super().__init__(config, file_type, path, temp_vars, asset_directory)
+        metadata_name = self.get_file_name()
+        if config.requested_metadata_files and metadata_name not in config.requested_metadata_files:
+            raise NotScheduled(metadata_name)
         self.data_type = "Collection"
         self.library = library
         if file_type == "Data":
@@ -357,7 +471,7 @@ class MetadataFile(DataFile):
                             auto_list = {str(k): f"{k}s" for k in addons if str(k) not in exclude and f"{k}s" not in exclude}
                             default_template = {"smart_filter": {"limit": 50, "sort_by": "critic_rating.desc", "any": {"year": f"<<value>>"}}}
                             default_title_format = "Best <<library_type>>s of <<key_name>>"
-                        elif auto_type in ["genre", "mood", "style", "country", "studio", "network", "year", "decade", "content_rating", "subtitle_language", "audio_language", "resolution"]:
+                        elif auto_type in ["genre", "mood", "style", "album_style", "country", "studio", "network", "year", "decade", "content_rating", "subtitle_language", "audio_language", "resolution"]:
                             search_tag = auto_type_translation[auto_type] if auto_type in auto_type_translation else auto_type
                             if library.is_show and auto_type in ["resolution", "subtitle_language", "audio_language"]:
                                 tags = library.get_tags(f"episode.{search_tag}")
@@ -378,8 +492,11 @@ class MetadataFile(DataFile):
                                 all_keys = [str(i.title) for i in tags]
                                 auto_list = {str(i.title): i.title for i in tags if str(i.title) not in exclude}
                             if library.is_music:
-                                default_template = {"smart_filter": {"limit": 50, "sort_by": "plays.desc", "any": {f"artist_{auto_type}": f"<<value>>"}}}
-                                default_title_format = "Most Played <<key_name>> <<library_type>>s"
+                                final_var = auto_type if auto_type.startwith("album") else f"artist_{auto_type}"
+                                default_template = {"smart_filter": {"limit": 50, "sort_by": "plays.desc", "any": {final_var: f"<<value>>"}}}
+                                if auto_type.startwith("album"):
+                                    default_template["collection_level"] = "album"
+                                default_title_format = f"Most Played <<key_name>> {'Albums' if auto_type.startwith('album') else '<<library_type>>'}s"
                             elif auto_type == "resolution":
                                 default_template = {"smart_filter": {"sort_by": "title.asc", "any": {auto_type: f"<<value>>"}}}
                                 default_title_format = "<<key_name>> <<library_type>>s"
@@ -781,7 +898,7 @@ class MetadataFile(DataFile):
                             item = self.library.search_item(alt_title)
 
                 if item is None:
-                    logger.error(f"Skipping {mapping_name}: Item {mapping_name} not found")
+                    logger.error(f"Skipping {mapping_name}: Item {title} not found")
                     continue
             if not isinstance(item, list):
                 item = [item]

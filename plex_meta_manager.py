@@ -5,6 +5,8 @@ from datetime import datetime
 try:
     import plexapi, requests, schedule
     from modules.logs import MyLogger
+    from PIL import ImageFile
+    from plexapi import server
     from plexapi.exceptions import NotFound
     from plexapi.video import Show, Season
 except ModuleNotFoundError:
@@ -113,7 +115,7 @@ from modules import util
 util.logger = logger
 from modules.builder import CollectionBuilder
 from modules.config import ConfigFile
-from modules.util import Failed, NotScheduled, Deleted
+from modules.util import Failed, NonExisting, NotScheduled, Deleted
 
 def my_except_hook(exctype, value, tb):
     if issubclass(exctype, KeyboardInterrupt):
@@ -146,6 +148,7 @@ if not uuid_num:
         handle.write(str(uuid_num))
 
 plexapi.BASE_HEADERS["X-Plex-Client-Identifier"] = str(uuid_num)
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 def process(attrs):
     with ProcessPoolExecutor(max_workers=1) as executor:
@@ -243,7 +246,7 @@ def run_config(config, stats):
 
     playlist_status = {}
     playlist_stats = {}
-    if (config.playlist_files or config.general["playlist_report"]) and not overlays_only and not operations_only and not collection_only:
+    if (config.playlist_files or config.general["playlist_report"]) and not overlays_only and not operations_only and not collection_only and not config.requested_metadata_files:
         logger.add_playlists_handler()
         if config.playlist_files:
             playlist_status, playlist_stats = run_playlists(config)
@@ -395,6 +398,7 @@ def run_libraries(config):
         try:
             logger.add_library_handler(library.mapping_name)
             plexapi.server.TIMEOUT = library.timeout
+            os.environ["PLEXAPI_PLEXAPI_TIMEOUT"] = str(library.timeout)
             logger.info("")
             logger.separator(f"{library.name} Library")
 
@@ -458,11 +462,15 @@ def run_libraries(config):
                 library.map_guids(temp_items)
             library_status[library.name]["Library Loading and Mapping"] = str(datetime.now() - time_start).split('.')[0]
 
-            if config.library_first and not config.test_mode and not collection_only and not playlist_only:
-                if not overlays_only and library.library_operation:
-                    library_status[library.name]["Library Operations"] = library.Operations.run_operations()
-                if not operations_only and (library.overlay_files or library.remove_overlays):
-                    library_status[library.name]["Library Overlays"] = library.Overlays.run_overlays()
+            def run_operations_and_overlays():
+                if not config.test_mode and not collection_only and not playlist_only and not config.requested_metadata_files:
+                    if not overlays_only and library.library_operation:
+                        library_status[library.name]["Library Operations"] = library.Operations.run_operations()
+                    if not operations_only and (library.overlay_files or library.remove_overlays):
+                        library_status[library.name]["Library Overlays"] = library.Overlays.run_overlays()
+
+            if config.library_first:
+                run_operations_and_overlays()
 
             if not operations_only and not overlays_only and not playlist_only:
                 time_start = datetime.now()
@@ -493,11 +501,8 @@ def run_libraries(config):
                         logger.re_add_library_handler(library.mapping_name)
                 library_status[library.name]["Library Metadata Files"] = str(datetime.now() - time_start).split('.')[0]
 
-            if not config.library_first and not config.test_mode and not collection_only and not playlist_only:
-                if not overlays_only and library.library_operation:
-                    library_status[library.name]["Library Operations"] = library.Operations.run_operations()
-                if not operations_only and (library.overlay_files or library.remove_overlays):
-                    library_status[library.name]["Library Overlays"] = library.Overlays.run_overlays()
+            if not config.library_first:
+                run_operations_and_overlays()
 
             logger.remove_library_handler(library.mapping_name)
         except Exception as e:
@@ -563,7 +568,16 @@ def run_collection(config, library, metadata, requested_collections):
                     logger.debug("")
                     logger.debug(f"Builder: {method}: {value}")
                     logger.info("")
-                    builder.filter_and_save_items(builder.gather_ids(method, value))
+                    try:
+                        builder.filter_and_save_items(builder.gather_ids(method, value))
+                    except NonExisting as e:
+                        if builder.ignore_blank_results:
+                            logger.warning(e)
+                        else:
+                            raise Failed(e)
+
+                if not builder.added_items and builder.ignore_blank_results:
+                    raise NonExisting(f"Overlay Warning: No items found")
 
                 if builder.filters or builder.tmdb_filters:
                     logger.info("")
@@ -654,6 +668,9 @@ def run_collection(config, library, metadata, requested_collections):
             if builder.run_again and (len(builder.run_again_movies) > 0 or len(builder.run_again_shows) > 0):
                 library.run_again.append(builder)
 
+        except NonExisting as e:
+            logger.warning(e)
+            library.status[str(mapping_name)]["status"] = "Ignored"
         except NotScheduled as e:
             logger.info(e)
             if str(e).endswith("and was deleted"):

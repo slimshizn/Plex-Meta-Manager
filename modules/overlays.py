@@ -1,8 +1,8 @@
 import os, re, time
 from datetime import datetime
-from modules import plex, util
+from modules import plex, util, overlay
 from modules.builder import CollectionBuilder
-from modules.util import Failed, NotScheduled
+from modules.util import Failed, NonExisting, NotScheduled
 from plexapi.exceptions import BadRequest
 from plexapi.video import Movie, Show, Season, Episode
 from PIL import Image, ImageFilter
@@ -90,20 +90,20 @@ class Overlays:
                     applied_names = []
                     queue_overlays = {}
                     for over_name in over_names:
-                        if over_name.startswith("blur"):
-                            blur_test = int(re.search("\\(([^)]+)\\)", over_name).group(1))
+                        current_overlay = properties[over_name]
+                        if current_overlay.name.startswith("blur"):
+                            logger.info(over_name)
+                            blur_test = int(re.search("\\(([^)]+)\\)", current_overlay.name).group(1))
                             if blur_test > blur_num:
                                 blur_num = blur_test
+                        elif current_overlay.queue:
+                            if current_overlay.queue not in queue_overlays:
+                                queue_overlays[current_overlay.queue] = {}
+                            if current_overlay.weight in queue_overlays[current_overlay.queue]:
+                                raise Failed("Overlay Error: Overlays in a queue cannot have the same weight")
+                            queue_overlays[current_overlay.queue][current_overlay.weight] = over_name
                         else:
-                            overlay = properties[over_name]
-                            if overlay.queue:
-                                if overlay.queue not in queue_overlays:
-                                    queue_overlays[overlay.queue] = {}
-                                if overlay.weight in queue_overlays[overlay.queue]:
-                                    raise Failed("Overlay Error: Overlays in a queue cannot have the same weight")
-                                queue_overlays[overlay.queue][overlay.weight] = over_name
-                            else:
-                                applied_names.append(over_name)
+                            applied_names.append(over_name)
 
                     overlay_change = False if has_overlay else True
                     if not overlay_change:
@@ -118,10 +118,10 @@ class Overlays:
 
                     if self.config.Cache:
                         for over_name in over_names:
-                            overlay = properties[over_name]
-                            if overlay.name in util.special_text_overlays:
-                                rating_type = overlay.name[5:-1]
-                                if rating_type.endswith(tuple(util.rating_mods)):
+                            current_overlay = properties[over_name]
+                            if current_overlay.name in overlay.special_text_overlays:
+                                rating_type = current_overlay.name[5:-1]
+                                if rating_type.endswith(tuple(overlay.rating_mods)):
                                     rating_type = rating_type[:-1]
                                 cache_rating = self.config.Cache.query_overlay_ratings(item.ratingKey, rating_type)
                                 actual = plex.attribute_translation[rating_type]
@@ -132,11 +132,14 @@ class Overlays:
 
                     try:
                         poster, background, item_dir, name = self.library.find_item_assets(item)
-                        if not poster and self.library.assets_for_all and self.library.show_missing_assets:
-                            if self.library.asset_folders:
-                                logger.warning(f"Asset Warning: No poster found in the assets folder '{item_dir}'")
-                            else:
-                                logger.warning(f"Asset Warning: No poster '{name}' found in the assets folders")
+                        if not poster and self.library.assets_for_all:
+                            if (isinstance(item, Episode) and self.library.show_missing_episode_assets) or \
+                                    (isinstance(item, Season) and self.library.show_missing_season_assets) or \
+                                    (not isinstance(item, (Episode, Season)) and self.library.show_missing_assets):
+                                if self.library.asset_folders:
+                                    logger.warning(f"Asset Warning: No poster found for '{item_title}' in the assets folder '{item_dir}'")
+                                else:
+                                    logger.warning(f"Asset Warning: No poster '{name}' found in the assets folders")
                         if background:
                             self.library.upload_images(item, background=background)
                     except Failed as e:
@@ -150,14 +153,19 @@ class Overlays:
                         if image_compare and str(poster.compare) != str(image_compare):
                             changed_image = True
                     elif has_overlay:
-                        if os.path.exists(os.path.join(self.library.overlay_backup, f"{item.ratingKey}.png")):
+                        if self.library.reset_overlays is not None:
+                            if self.library.reset_overlays == "tmdb":
+                                new_backup = self.find_poster_url(item)
+                            else:
+                                posters = item.posters()
+                                if posters:
+                                    new_backup = posters[0]
+                        elif os.path.exists(os.path.join(self.library.overlay_backup, f"{item.ratingKey}.png")):
                             has_original = os.path.join(self.library.overlay_backup, f"{item.ratingKey}.png")
                         elif os.path.exists(os.path.join(self.library.overlay_backup, f"{item.ratingKey}.jpg")):
                             has_original = os.path.join(self.library.overlay_backup, f"{item.ratingKey}.jpg")
                         else:
                             new_backup = self.find_poster_url(item)
-                            if new_backup is None:
-                                new_backup = item.posterUrl
                     else:
                         new_backup = item.posterUrl
                     if new_backup:
@@ -188,9 +196,9 @@ class Overlays:
 
                             def get_text(text):
                                 text = text[5:-1]
-                                if f"text({text})" in util.special_text_overlays:
+                                if f"text({text})" in overlay.special_text_overlays:
                                     rating_code = text[-1:]
-                                    text_rating_type = text[:-1] if rating_code in util.rating_mods else text
+                                    text_rating_type = text[:-1] if rating_code in overlay.rating_mods else text
                                     text_actual = plex.attribute_translation[text_rating_type]
                                     if not hasattr(item, text_actual) or getattr(item, text_actual) is None:
                                         raise Failed(f"Overlay Warning: No {text_rating_type} found")
@@ -204,31 +212,31 @@ class Overlays:
                                 return str(text)
 
                             for over_name in applied_names:
-                                overlay = properties[over_name]
-                                if overlay.name.startswith("text"):
-                                    if overlay.name in util.special_text_overlays:
-                                        image_box = overlay.image.size if overlay.image else None
+                                current_overlay = properties[over_name]
+                                if current_overlay.name.startswith("text"):
+                                    if current_overlay.name in overlay.special_text_overlays:
+                                        image_box = current_overlay.image.size if current_overlay.image else None
                                         try:
-                                            overlay_image, addon_box = overlay.get_backdrop((canvas_width, canvas_height), box=image_box, text=get_text(overlay.name))
+                                            overlay_image, addon_box = current_overlay.get_backdrop((canvas_width, canvas_height), box=image_box, text=get_text(current_overlay.name))
                                         except Failed as e:
                                             logger.warning(e)
                                             continue
                                         new_poster.paste(overlay_image, (0, 0), overlay_image)
-                                        if overlay.image:
-                                            new_poster.paste(overlay.image, addon_box, overlay.image)
+                                        if current_overlay.image:
+                                            new_poster.paste(current_overlay.image, addon_box, current_overlay.image)
                                     else:
-                                        overlay_image = overlay.landscape if isinstance(item, Episode) else overlay.portrait
+                                        overlay_image = current_overlay.landscape if isinstance(item, Episode) else current_overlay.portrait
                                         new_poster.paste(overlay_image, (0, 0), overlay_image)
                                 else:
-                                    if overlay.has_coordinates():
-                                        if overlay.portrait is not None:
-                                            overlay_image = overlay.landscape if isinstance(item, Episode) else overlay.portrait
+                                    if current_overlay.has_coordinates():
+                                        if current_overlay.portrait is not None:
+                                            overlay_image = current_overlay.landscape if isinstance(item, Episode) else current_overlay.portrait
                                             new_poster.paste(overlay_image, (0, 0), overlay_image)
-                                        overlay_box = overlay.landscape_box if isinstance(item, Episode) else overlay.portrait_box
-                                        new_poster.paste(overlay.image, overlay_box, overlay.image)
+                                        overlay_box = current_overlay.landscape_box if isinstance(item, Episode) else current_overlay.portrait_box
+                                        new_poster.paste(current_overlay.image, overlay_box, current_overlay.image)
                                     else:
-                                        new_poster = new_poster.resize(overlay.image.size, Image.ANTIALIAS)
-                                        new_poster.paste(overlay.image, (0, 0), overlay.image)
+                                        new_poster = new_poster.resize(current_overlay.image.size, Image.ANTIALIAS)
+                                        new_poster.paste(current_overlay.image, (0, 0), current_overlay.image)
 
                             for queue, weights in queue_overlays.items():
                                 if queue not in queues:
@@ -240,24 +248,24 @@ class Overlays:
                                     if len(sorted_weights) <= o:
                                         break
                                     over_name = sorted_weights[o][1]
-                                    overlay = properties[over_name]
-                                    if overlay.name.startswith("text"):
-                                        image_box = overlay.image.size if overlay.image else None
+                                    current_overlay = properties[over_name]
+                                    if current_overlay.name.startswith("text"):
+                                        image_box = current_overlay.image.size if current_overlay.image else None
                                         try:
-                                            overlay_image, addon_box = overlay.get_backdrop((canvas_width, canvas_height), box=image_box, text=get_text(overlay.name), new_cords=cord)
+                                            overlay_image, addon_box = current_overlay.get_backdrop((canvas_width, canvas_height), box=image_box, text=get_text(current_overlay.name), new_cords=cord)
                                         except Failed as e:
                                             logger.warning(e)
                                             continue
                                         new_poster.paste(overlay_image, (0, 0), overlay_image)
-                                        if overlay.image:
-                                            new_poster.paste(overlay.image, addon_box, overlay.image)
+                                        if current_overlay.image:
+                                            new_poster.paste(current_overlay.image, addon_box, current_overlay.image)
                                     else:
-                                        if overlay.has_back:
-                                            overlay_image, overlay_box = overlay.get_backdrop((canvas_width, canvas_height), box=overlay.image.size, new_cords=cord)
+                                        if current_overlay.has_back:
+                                            overlay_image, overlay_box = current_overlay.get_backdrop((canvas_width, canvas_height), box=current_overlay.image.size, new_cords=cord)
                                             new_poster.paste(overlay_image, (0, 0), overlay_image)
                                         else:
-                                            overlay_box = overlay.get_coordinates((canvas_width, canvas_height), box=overlay.image.size, new_cords=cord)
-                                        new_poster.paste(overlay.image, overlay_box, overlay.image)
+                                            overlay_box = current_overlay.get_coordinates((canvas_width, canvas_height), box=current_overlay.image.size, new_cords=cord)
+                                        new_poster.paste(current_overlay.image, overlay_box, current_overlay.image)
                             temp = os.path.join(self.library.overlay_folder, f"temp.png")
                             new_poster.save(temp, "PNG")
                             self.library.upload_poster(item, temp)
@@ -265,7 +273,7 @@ class Overlays:
                             self.library.reload(item, force=True)
                             poster_compare = poster.compare if poster else item.thumb
                             logger.info(f"{item_title[:60]:<60} | Overlays Applied: {', '.join(over_names)}")
-                        except (OSError, BadRequest) as e:
+                        except (OSError, BadRequest, SyntaxError) as e:
                             logger.stacktrace()
                             raise Failed(f"{item_title[:60]:<60} | Overlay Error: {e}")
                     elif self.library.show_asset_not_needed:
@@ -294,7 +302,7 @@ class Overlays:
                 if not isinstance(v, list):
                     raise Failed(f"Overlay Error: Queue: {k} must be a list")
                 try:
-                    queues[k] = [util.parse_cords(q, f"{k} queue", required=True) for q in v]
+                    queues[k] = [overlay.parse_cords(q, f"{k} queue", required=True) for q in v]
                 except Failed as e:
                     logger.error(e)
             for k, v in overlay_file.overlays.items():
@@ -308,18 +316,25 @@ class Overlays:
                         raise Failed(f"Overlay Error: Overlay {builder.overlay.mapping_name} already exists")
                     properties[builder.overlay.mapping_name] = builder.overlay
 
-                    for method, value in builder.builders:
-                        logger.debug("")
-                        logger.debug(f"Builder: {method}: {value}")
-                        logger.info("")
-                        builder.filter_and_save_items(builder.gather_ids(method, value))
-
                     if builder.filters or builder.tmdb_filters:
                         logger.info("")
                         for filter_key, filter_value in builder.filters:
                             logger.info(f"Collection Filter {filter_key}: {filter_value}")
                         for filter_key, filter_value in builder.tmdb_filters:
                             logger.info(f"Collection Filter {filter_key}: {filter_value}")
+
+                    for method, value in builder.builders:
+                        logger.debug("")
+                        logger.debug(f"Builder: {method}: {value}")
+                        logger.info("")
+                        try:
+                            builder.filter_and_save_items(builder.gather_ids(method, value))
+                        except NonExisting as e:
+                            if builder.ignore_blank_results:
+                                logger.warning("")
+                                logger.warning(e)
+                            else:
+                                raise Failed(e)
 
                     added_titles = []
                     if builder.added_items:
@@ -330,12 +345,16 @@ class Overlays:
                                 properties[builder.overlay.mapping_name].keys.append(item.ratingKey)
                     if added_titles:
                         logger.debug(f"{len(added_titles)} Titles Found: {[self.library.get_item_sort_title(a, atr='title') for a in added_titles]}")
-                    logger.info(f"{len(added_titles) if added_titles else 'No'} Items found for {builder.overlay.mapping_name}")
+                        logger.info(f"{len(added_titles)} Items found for {builder.overlay.mapping_name} Overlay")
+                    else:
+                        logger.warning(f"No Items found for {builder.overlay.mapping_name} Overlay")
+                    logger.info("")
                 except NotScheduled as e:
                     logger.info(e)
                 except Failed as e:
                     logger.stacktrace()
                     logger.error(e)
+                    logger.info("")
 
         for overlay_name, over_obj in properties.items():
             if over_obj.group:

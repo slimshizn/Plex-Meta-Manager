@@ -313,7 +313,9 @@ show_sorts = {
     "title.asc": "titleSort", "title.desc": "titleSort%3Adesc",
     "year.asc": "year", "year.desc": "year%3Adesc",
     "originally_available.asc": "originallyAvailableAt", "originally_available.desc": "originallyAvailableAt%3Adesc",
+    "episode_originally_available.asc": "episode.originallyAvailableAt", "episode_originally_available.desc": "episode.originallyAvailableAt%3Adesc",
     "release.asc": "originallyAvailableAt", "release.desc": "originallyAvailableAt%3Adesc",
+    "episode_release.asc": "episode.originallyAvailableAt", "episode_release.desc": "episode.originallyAvailableAt%3Adesc",
     "critic_rating.asc": "rating", "critic_rating.desc": "rating%3Adesc",
     "audience_rating.asc": "audienceRating", "audience_rating.desc": "audienceRating%3Adesc",
     "user_rating.asc": "userRating",  "user_rating.desc": "userRating%3Adesc",
@@ -337,7 +339,9 @@ episode_sorts = {
     "show.desc": "show.titleSort%3Adesc%2Cseason.index%3AnullsLast%2Cepisode.index%3AnullsLast%2Cepisode.originallyAvailableAt%3AnullsLast%2Cepisode.titleSort%2Cepisode.id",
     "year.asc": "year", "year.desc": "year%3Adesc",
     "originally_available.asc": "originallyAvailableAt", "originally_available.desc": "originallyAvailableAt%3Adesc",
+    "episode_originally_available.asc": "episode.originallyAvailableAt", "episode_originally_available.desc": "episode.originallyAvailableAt%3Adesc",
     "release.asc": "originallyAvailableAt", "release.desc": "originallyAvailableAt%3Adesc",
+    "episode_release.asc": "episode.originallyAvailableAt", "episode_release.desc": "episode.originallyAvailableAt%3Adesc",
     "critic_rating.asc": "rating", "critic_rating.desc": "rating%3Adesc",
     "audience_rating.asc": "audienceRating", "audience_rating.desc": "audienceRating%3Adesc",
     "user_rating.asc": "userRating",  "user_rating.desc": "userRating%3Adesc",
@@ -409,6 +413,8 @@ class Plex(Library):
         logger.secret(self.token)
         try:
             self.PlexServer = PlexServer(baseurl=self.url, token=self.token, session=self.config.session, timeout=self.timeout)
+            plexapi.server.TIMEOUT = self.timeout
+            os.environ["PLEXAPI_PLEXAPI_TIMEOUT"] = str(self.timeout)
         except Unauthorized:
             raise Failed("Plex Error: Plex token is invalid")
         except ValueError as e:
@@ -839,13 +845,12 @@ class Plex(Library):
             logger.info(f"Processed {len(all_items)} {self.type}s")
         else:
             raise Failed(f"Plex Error: Method {method} not supported")
-        if len(items) > 0:
-            ids = [(item.ratingKey, "ratingKey") for item in items]
-            logger.debug("")
-            logger.debug(f"{len(ids)} Keys Found: {ids}")
-            return ids
-        else:
+        if not items:
             raise Failed("Plex Error: No Items found in Plex")
+        ids = [(item.ratingKey, "ratingKey") for item in items]
+        logger.debug("")
+        logger.debug(f"{len(ids)} Keys Found: {ids}")
+        return ids
 
     def get_collection_items(self, collection, smart_label_collection):
         if smart_label_collection:
@@ -917,7 +922,7 @@ class Plex(Library):
             final = f"{obj.title[:25]:<25} | {attr_display} | {display}" if display else display
             if do_print and final:
                 logger.info(final)
-        return final
+        return final[28:] if final else final
 
     def item_images(self, item, group, alias, asset_location=None, title=None, image_name=None, folder_name=None):
         if title is None:
@@ -1028,7 +1033,12 @@ class Plex(Library):
 
         if not item_asset_directory:
             if isinstance(item, (Movie, Artist, Album, Show, Episode, Season)):
-                starting = item.show() if isinstance(item, (Episode, Season)) else item
+                if isinstance(item, (Episode, Season)):
+                    starting = item.show()
+                elif isinstance(item, (Album, Track)):
+                    starting = item.artist()
+                else:
+                    starting = item
                 if not starting.locations:
                     raise Failed(f"Asset Warning: No video filepath found fo {item.title}")
                 path_test = str(starting.locations[0])

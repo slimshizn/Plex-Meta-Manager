@@ -1,7 +1,7 @@
 import base64, os, requests
 from datetime import datetime
 from lxml import html
-from modules import util, radarr, sonarr
+from modules import util, radarr, sonarr, operations
 from modules.anidb import AniDB
 from modules.anilist import AniList
 from modules.cache import Cache
@@ -41,6 +41,7 @@ mass_episode_rating_options = {"tmdb": "Use TMDb Rating", "imdb": "Use IMDb Rati
 mass_rating_options = {
     "tmdb": "Use TMDb Rating",
     "imdb": "Use IMDb Rating",
+    "trakt_user": "Use Trakt User Rating",
     "omdb": "Use IMDb Rating through OMDb",
     "mdb": "Use MdbList Average Score",
     "mdb_imdb": "Use IMDb Rating through MDbList",
@@ -54,6 +55,7 @@ mass_rating_options = {
     "anidb_rating": "Use AniDB Rating",
     "anidb_average": "Use AniDB Average"
 }
+reset_overlay_options = {"tmdb": "Reset to TMDb poster", "plex": "Reset to Plex Poster"}
 
 class ConfigFile:
     def __init__(self, default_dir, attrs):
@@ -198,7 +200,7 @@ class ConfigFile:
         if "trakt" in self.data:                       self.data["trakt"] = self.data.pop("trakt")
         if "mal" in self.data:                         self.data["mal"] = self.data.pop("mal")
 
-        def check_for_attribute(data, attribute, parent=None, test_list=None, default=None, do_print=True, default_is_none=False, req_default=False, var_type="str", throw=False, save=True):
+        def check_for_attribute(data, attribute, parent=None, test_list=None, default=None, do_print=True, default_is_none=False, req_default=False, var_type="str", throw=False, save=True, int_min=0):
             endline = ""
             if parent is not None:
                 if data and parent in data:
@@ -231,7 +233,7 @@ class ConfigFile:
                 if isinstance(data[attribute], bool):                               return data[attribute]
                 else:                                                               message = f"{text} must be either true or false"
             elif var_type == "int":
-                if isinstance(data[attribute], int) and data[attribute] >= 0:       return data[attribute]
+                if isinstance(data[attribute], int) and data[attribute] >= int_min: return data[attribute]
                 else:                                                               message = f"{text} must an integer >= 0"
             elif var_type == "path":
                 if os.path.exists(os.path.abspath(data[attribute])):                return data[attribute]
@@ -287,7 +289,7 @@ class ConfigFile:
 
         self.general = {
             "cache": check_for_attribute(self.data, "cache", parent="settings", var_type="bool", default=True),
-            "cache_expiration": check_for_attribute(self.data, "cache_expiration", parent="settings", var_type="int", default=60),
+            "cache_expiration": check_for_attribute(self.data, "cache_expiration", parent="settings", var_type="int", default=60, int_min=1),
             "asset_directory": check_for_attribute(self.data, "asset_directory", parent="settings", var_type="list_path", default_is_none=True),
             "asset_folders": check_for_attribute(self.data, "asset_folders", parent="settings", var_type="bool", default=True),
             "asset_depth": check_for_attribute(self.data, "asset_depth", parent="settings", var_type="int", default=0),
@@ -390,7 +392,7 @@ class ConfigFile:
                 self.TMDb = TMDb(self, {
                     "apikey": check_for_attribute(self.data, "apikey", parent="tmdb", throw=True),
                     "language": check_for_attribute(self.data, "language", parent="tmdb", default="en"),
-                    "expiration": check_for_attribute(self.data, "cache_expiration", parent="tmdb", var_type="int", default=60)
+                    "expiration": check_for_attribute(self.data, "cache_expiration", parent="tmdb", var_type="int", default=60, int_min=1)
                 })
                 region = check_for_attribute(self.data, "region", parent="tmdb", test_list=self.TMDb.iso_3166_1, default_is_none=True)
                 self.TMDb.region = str(region).upper() if region else region
@@ -406,7 +408,7 @@ class ConfigFile:
                 try:
                     self.OMDb = OMDb(self, {
                         "apikey": check_for_attribute(self.data, "apikey", parent="omdb", throw=True),
-                        "expiration": check_for_attribute(self.data, "cache_expiration", parent="omdb", var_type="int", default=60)
+                        "expiration": check_for_attribute(self.data, "cache_expiration", parent="omdb", var_type="int", default=60, int_min=1)
                     })
                 except Failed as e:
                     logger.error(e)
@@ -422,7 +424,7 @@ class ConfigFile:
                 try:
                     self.Mdblist.add_key(
                         check_for_attribute(self.data, "apikey", parent="mdblist", throw=True),
-                        check_for_attribute(self.data, "cache_expiration", parent="mdblist", var_type="int", default=60)
+                        check_for_attribute(self.data, "cache_expiration", parent="mdblist", var_type="int", default=60, int_min=1)
                     )
                     logger.info("Mdblist Connection Successful")
                 except Failed as e:
@@ -459,6 +461,7 @@ class ConfigFile:
                     self.MyAnimeList = MyAnimeList(self, {
                         "client_id": check_for_attribute(self.data, "client_id", parent="mal", throw=True),
                         "client_secret": check_for_attribute(self.data, "client_secret", parent="mal", throw=True),
+                        "localhost_url": check_for_attribute(self.data, "localhost_url", parent="mal", default_is_none=True),
                         "config_path": self.config_path,
                         "authorization": self.data["mal"]["authorization"] if "authorization" in self.data["mal"] else None
                     })
@@ -673,7 +676,7 @@ class ConfigFile:
                         if "mass_imdb_parental_labels" in lib["operations"]:
                             params["mass_imdb_parental_labels"] = check_for_attribute(lib["operations"], "mass_imdb_parental_labels", test_list=imdb_label_options, default_is_none=True, save=False)
                         if "mass_trakt_rating_update" in lib["operations"]:
-                            params["mass_trakt_rating_update"] = check_for_attribute(lib["operations"], "mass_trakt_rating_update", var_type="bool", default=False, save=False)
+                            params["mass_trakt_rating_update"] = check_for_attribute(lib["operations"], "mass_trakt_rating_update", var_type="bool", default=False, save=False, do_print=False)
                         if "split_duplicates" in lib["operations"]:
                             params["split_duplicates"] = check_for_attribute(lib["operations"], "split_duplicates", var_type="bool", default=False, save=False)
                         if "radarr_add_all_existing" in lib["operations"]:
@@ -731,18 +734,23 @@ class ConfigFile:
                     else:
                         logger.error("Config Error: operations must be a dictionary")
 
+                if params["mass_trakt_rating_update"]:
+                    if params["mass_user_rating_update"]:
+                        logger.error("Config Error: User Rating is already being set by mass_user_rating_update")
+                    else:
+                        params["mass_user_rating_update"] = "trakt_user"
+
                 def error_check(attr, service):
                     logger.error(f"Config Error: Operation {attr} cannot be {params[attr]} without a successful {service} Connection")
                     params[attr] = None
 
-                for mass_key in ["mass_genre_update", "mass_audience_rating_update", "mass_critic_rating_update", "mass_content_rating_update", "mass_originally_available_update"]:
+                for mass_key in operations.meta_operations:
                     if params[mass_key] == "omdb" and self.OMDb is None:
                         error_check(mass_key, "OMDb")
                     if params[mass_key] and params[mass_key].startswith("mdb") and not self.Mdblist.has_key:
-                        error_check(mass_key, "MdbList API")
-
-                if self.Trakt is None and params["mass_trakt_rating_update"]:
-                    error_check("mass_trakt_rating_update", "Trakt")
+                        error_check(mass_key, "MdbList")
+                    if params[mass_key] and params[mass_key].startswith("trakt") and self.Trakt is None:
+                        error_check(mass_key, "Trakt")
 
                 lib_vars = {}
                 if lib and "template_variables" in lib and lib["template_variables"] and isinstance(lib["template_variables"], dict):
@@ -776,6 +784,7 @@ class ConfigFile:
                     params["overlay_path"] = []
                     params["remove_overlays"] = False
                     params["reapply_overlays"] = False
+                    params["reset_overlays"] = None
                     if lib and "overlay_path" in lib:
                         try:
                             if not lib["overlay_path"]:
@@ -792,6 +801,15 @@ class ConfigFile:
                                     if ("reapply_overlays" in file and file["reapply_overlays"] is True) \
                                         or ("reapply_overlay" in file and file["reapply_overlay"] is True):
                                         params["reapply_overlays"] = True
+                                    if "reset_overlays" in file or "reset_overlay" in file:
+                                        attr = f"reset_overlay{'s' if 'reset_overlays' in file else ''}"
+                                        if file[attr] and file[attr] in reset_overlay_options:
+                                            params["reset_overlays"] = file[attr]
+                                        else:
+                                            final_text = f"Config Error: reset_overlays attribute {file[attr]} invalid. Options: "
+                                            for option, description in reset_overlay_options.items():
+                                                final_text = f"{final_text}\n    {option} ({description})"
+                                            logger.error(final_text)
                                     if "schedule" in file and file["schedule"]:
                                         logger.debug(f"Value: {file['schedule']}")
                                         err = None
